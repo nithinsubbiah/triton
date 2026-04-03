@@ -170,22 +170,21 @@ bool canUseBufferOps(Value ptr,
 }
 
 // Buffer ops require i32 offsets. If the offset is already i32, return it
-// as-is. If it is i64, insert an arith.trunci right after the offset's
-// definition. Uses InsertionGuard to restore the caller's insertion point.
-Value truncateOffsetToI32(Value origOffset, OpBuilder &builder, Location loc) {
+// as-is. If it is i64, insert an arith.trunci right before insertBefore.
+// The caller's insertion point is saved and restored automatically.
+Value truncateOffsetToI32(Value origOffset, OpBuilder &builder, Location loc,
+                          Operation *insertBefore) {
   auto offsetTy = cast<RankedTensorType>(origOffset.getType());
   if (offsetTy.getElementTypeBitWidth() == 32)
     return origOffset;
   OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointAfterValue(origOffset);
+  builder.setInsertionPoint(insertBefore);
   auto i32Ty = RankedTensorType::get(offsetTy.getShape(), builder.getI32Type(),
                                      offsetTy.getEncoding());
   return arith::TruncIOp::create(builder, loc, i32Ty, origOffset);
 }
 
-// Extract stride of the blocked offset of LD/ST ops. The offset must be the
-// original (pre-truncation) value so the add->broadcast->mul->splat chain is
-// intact for pattern matching.
+// Extract stride of the blocked offset of LD/ST ops.
 Value getBlockStride(Location loc, Value offset, PatternRewriter &rewriter) {
   // canonicalize pointer pass sets block stride via
   // `offset:add-broadcast-muli-splat`, backtrace that pattern to reach the
@@ -250,14 +249,6 @@ struct ConvertTritonAtomicCASOpToBufferAtomicCAS
           op, "CAS with unsupported memory ordering");
     }
 
-    auto addPtrOp = ptr.getDefiningOp<triton::AddPtrOp>();
-    Value tensorPtr = addPtrOp.getPtr();
-    Value origOffset = addPtrOp.getOffset();
-    Value tensorOffset =
-        truncateOffsetToI32(origOffset, rewriter, op->getLoc());
-    auto splatOp = tensorPtr.getDefiningOp<triton::SplatOp>();
-    Value basePtr = splatOp.getSrc();
-
     // Buffer atomic CAS only supports i32/i64
     auto checkType = getElementTypeOrSelf(op.getVal());
     bool isSupportedType = checkType.isInteger(32) || checkType.isInteger(64);
@@ -266,6 +257,14 @@ struct ConvertTritonAtomicCASOpToBufferAtomicCAS
     }
     LDBG("AtomicCAS supported type");
 
+    // All checks passed; now safe to modify IR.
+    auto addPtrOp = ptr.getDefiningOp<triton::AddPtrOp>();
+    Value tensorPtr = addPtrOp.getPtr();
+    Value offset = addPtrOp.getOffset();
+    Value offsetI32 = truncateOffsetToI32(offset, rewriter, op->getLoc(), op);
+    auto splatOp = tensorPtr.getDefiningOp<triton::SplatOp>();
+    Value basePtr = splatOp.getSrc();
+
     // Buffer atomics support 32 and 64-bit operations, so inputs must be at
     // least 32-bits. Otherwise, fall back to the existing path for atomics
     auto opValueType = op.getVal().getType();
@@ -273,7 +272,7 @@ struct ConvertTritonAtomicCASOpToBufferAtomicCAS
     if (auto tensorType = dyn_cast<RankedTensorType>(opValueType)) {
       auto elemBitWidth = tensorType.getElementTypeBitWidth();
       opBitWidth =
-          getVectorSize(basePtr, tensorOffset, axisAnalysisPass) * elemBitWidth;
+          getVectorSize(basePtr, offsetI32, axisAnalysisPass) * elemBitWidth;
     } else {
       opBitWidth = opValueType.getIntOrFloatBitWidth();
     }
@@ -282,10 +281,10 @@ struct ConvertTritonAtomicCASOpToBufferAtomicCAS
       return rewriter.notifyMatchFailure(
           op, "BufferAtomicCAS requires opBitWidth >= 32");
     }
-    Value blockStride = getBlockStride(op->getLoc(), origOffset, rewriter);
+    Value blockStride = getBlockStride(op->getLoc(), offsetI32, rewriter);
     rewriter.replaceOpWithNewOp<triton::amdgpu::BufferAtomicCASOp>(
-        op, op.getVal().getType(), basePtr, tensorOffset, op.getCmp(),
-        op.getVal(), blockStride, sem, scope);
+        op, op.getVal().getType(), basePtr, offsetI32, op.getCmp(), op.getVal(),
+        blockStride, sem, scope);
     return success();
   }
 
@@ -350,14 +349,6 @@ struct ConvertTritonAtomicRMWOpToBufferAtomicRMW
       return rewriter.notifyMatchFailure(
           op, "RMW with unsupported memory ordering");
     }
-
-    auto addPtrOp = ptr.getDefiningOp<triton::AddPtrOp>();
-    Value tensorPtr = addPtrOp.getPtr();
-    Value origOffset = addPtrOp.getOffset();
-    Value tensorOffset =
-        truncateOffsetToI32(origOffset, rewriter, op->getLoc());
-    auto splatOp = tensorPtr.getDefiningOp<triton::SplatOp>();
-    Value basePtr = splatOp.getSrc();
 
     // 4. Buffer atomic RMW does not support FP8 ops
     //    easier to just check what we support
@@ -434,13 +425,21 @@ struct ConvertTritonAtomicRMWOpToBufferAtomicRMW
       return rewriter.notifyMatchFailure(op, "RMW requires opBitWidth >= 32");
     }
 
+    // All checks passed; now safe to modify IR.
+    auto addPtrOp = ptr.getDefiningOp<triton::AddPtrOp>();
+    Value tensorPtr = addPtrOp.getPtr();
+    Value offset = addPtrOp.getOffset();
+    Value offsetI32 = truncateOffsetToI32(offset, rewriter, op->getLoc(), op);
+    auto splatOp = tensorPtr.getDefiningOp<triton::SplatOp>();
+    Value basePtr = splatOp.getSrc();
+
     Value maybeMask{};
     if (op.getMask() && !isSplatOneConstTensor(op.getMask()))
       maybeMask = op.getMask();
-    Value blockStride = getBlockStride(op->getLoc(), origOffset, rewriter);
+    Value blockStride = getBlockStride(op->getLoc(), offsetI32, rewriter);
     rewriter.replaceOpWithNewOp<triton::amdgpu::BufferAtomicRMWOp>(
-        op, op.getVal().getType(), atomicRmwOp, basePtr, tensorOffset,
-        op.getVal(), blockStride, sem, scope, maybeMask);
+        op, op.getVal().getType(), atomicRmwOp, basePtr, offsetI32, op.getVal(),
+        blockStride, sem, scope, maybeMask);
 
     return success();
   }
@@ -479,9 +478,8 @@ struct ConvertTritonLoadToBufferLoad : public mlir::OpRewritePattern<SourceOp> {
     if (canUseBufferOps(ptr, assumptions, solver, analyzeSmallTensorOfst)) {
       auto addPtrOp = ptr.getDefiningOp<triton::AddPtrOp>();
       Value tensorPtr = addPtrOp.getPtr();
-      Value origOffset = addPtrOp.getOffset();
-      Value tensorOffset =
-          truncateOffsetToI32(origOffset, rewriter, op->getLoc());
+      Value offset = addPtrOp.getOffset();
+      Value offsetI32 = truncateOffsetToI32(offset, rewriter, op->getLoc(), op);
       auto splatOp = tensorPtr.getDefiningOp<triton::SplatOp>();
       Value basePtr = splatOp.getSrc();
       Value maybeOther{};
@@ -490,7 +488,7 @@ struct ConvertTritonLoadToBufferLoad : public mlir::OpRewritePattern<SourceOp> {
       Value maybeMask{};
       if (op.getMask() && !isSplatOneConstTensor(op.getMask()))
         maybeMask = op.getMask();
-      Value blockStride = getBlockStride(op->getLoc(), origOffset, rewriter);
+      Value blockStride = getBlockStride(op->getLoc(), offsetI32, rewriter);
 
       auto bufferLoadOp = [&]() {
         if constexpr (std::is_same_v<SourceOp, triton::LoadOp>) {
@@ -499,14 +497,14 @@ struct ConvertTritonLoadToBufferLoad : public mlir::OpRewritePattern<SourceOp> {
             contig = std::min<unsigned>(
                 contig, axisAnalysisPass.getMaskAlignment(maybeMask));
           return triton::amdgpu::BufferLoadOp::create(
-              rewriter, op->getLoc(), op.getType(), basePtr, tensorOffset,
+              rewriter, op->getLoc(), op.getType(), basePtr, offsetI32,
               blockStride, op.getCache(), maybeMask, maybeOther, contig);
         } else if constexpr (std::is_same_v<
                                  SourceOp,
                                  triton::gpu::AsyncCopyGlobalToLocalOp>) {
           return triton::amdgpu::BufferLoadToLocalOp::create(
               rewriter, op->getLoc(), op.getType(), op.getResult(), basePtr,
-              tensorOffset, maybeMask, maybeOther, blockStride, op.getCache(),
+              offsetI32, maybeMask, maybeOther, blockStride, op.getCache(),
               op.getContiguity());
         } else {
           static_assert(always_false<SourceOp>::value,
@@ -555,9 +553,8 @@ struct ConvertTritonStoreToBufferStore
     if (canUseBufferOps(ptr, assumptions, solver, analyzeSmallTensorOfst)) {
       auto addPtrOp = ptr.getDefiningOp<triton::AddPtrOp>();
       Value tensorPtr = addPtrOp.getPtr();
-      Value origOffset = addPtrOp.getOffset();
-      Value tensorOffset =
-          truncateOffsetToI32(origOffset, rewriter, op->getLoc());
+      Value offset = addPtrOp.getOffset();
+      Value offsetI32 = truncateOffsetToI32(offset, rewriter, op->getLoc(), op);
       auto splatOp = tensorPtr.getDefiningOp<triton::SplatOp>();
       Value basePtr = splatOp.getSrc();
       Value maybeMask{};
@@ -567,10 +564,10 @@ struct ConvertTritonStoreToBufferStore
         contig = std::min<unsigned>(
             contig, axisAnalysisPass.getMaskAlignment(maybeMask));
       }
-      Value blockStride = getBlockStride(op->getLoc(), origOffset, rewriter);
+      Value blockStride = getBlockStride(op->getLoc(), offsetI32, rewriter);
 
       rewriter.replaceOpWithNewOp<triton::amdgpu::BufferStoreOp>(
-          op, op.getValue(), basePtr, tensorOffset, blockStride, op.getCache(),
+          op, op.getValue(), basePtr, offsetI32, blockStride, op.getCache(),
           maybeMask, contig);
       return success();
     }
