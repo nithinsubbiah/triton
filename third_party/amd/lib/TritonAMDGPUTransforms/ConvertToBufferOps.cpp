@@ -4,6 +4,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
@@ -209,6 +210,27 @@ Value getBlockStride(Location loc, Value offset, PatternRewriter &rewriter) {
   return nullptr;
 }
 
+// Buffer ops take Optional<I32> stride. getBlockStride walks the offset chain
+// and returns the splat's scalar source, which may be i64 when the kernel uses
+// i64 indices (e.g. row * stride + col with stride in i64).
+static Value maybeTruncateStrideToI32(Value stride, PatternRewriter &rewriter,
+                                      Location loc, Operation *insertBefore) {
+  if (!stride)
+    return stride;
+  auto intTy = dyn_cast<IntegerType>(stride.getType());
+  if (!intTy)
+    return stride;
+  if (intTy.getWidth() == 32)
+    return stride;
+  if (intTy.getWidth() == 64) {
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPoint(insertBefore);
+    return arith::TruncIOp::create(rewriter, loc, rewriter.getI32Type(),
+                                   stride);
+  }
+  return stride;
+}
+
 // /*-----------------AtomicCAS-------------------*/
 
 struct ConvertTritonAtomicCASOpToBufferAtomicCAS
@@ -290,7 +312,9 @@ struct ConvertTritonAtomicCASOpToBufferAtomicCAS
       return rewriter.notifyMatchFailure(
           op, "BufferAtomicCAS requires opBitWidth >= 32");
     }
-    Value blockStride = getBlockStride(op->getLoc(), tensorOffset, rewriter);
+    Value blockStride = maybeTruncateStrideToI32(
+        getBlockStride(op->getLoc(), tensorOffset, rewriter), rewriter,
+        op->getLoc(), op);
     rewriter.replaceOpWithNewOp<triton::amdgpu::BufferAtomicCASOp>(
         op, op.getVal().getType(), basePtr, tensorOffset, op.getCmp(),
         op.getVal(), blockStride, sem, scope);
@@ -446,7 +470,9 @@ struct ConvertTritonAtomicRMWOpToBufferAtomicRMW
     Value maybeMask{};
     if (op.getMask() && !isSplatOneConstTensor(op.getMask()))
       maybeMask = op.getMask();
-    Value blockStride = getBlockStride(op->getLoc(), tensorOffset, rewriter);
+    Value blockStride = maybeTruncateStrideToI32(
+        getBlockStride(op->getLoc(), tensorOffset, rewriter), rewriter,
+        op->getLoc(), op);
     rewriter.replaceOpWithNewOp<triton::amdgpu::BufferAtomicRMWOp>(
         op, op.getVal().getType(), atomicRmwOp, basePtr, tensorOffset,
         op.getVal(), blockStride, sem, scope, maybeMask);
@@ -499,7 +525,9 @@ struct ConvertTritonLoadToBufferLoad : public mlir::OpRewritePattern<SourceOp> {
       Value maybeMask{};
       if (op.getMask() && !isSplatOneConstTensor(op.getMask()))
         maybeMask = op.getMask();
-      Value blockStride = getBlockStride(op->getLoc(), tensorOffset, rewriter);
+      Value blockStride = maybeTruncateStrideToI32(
+          getBlockStride(op->getLoc(), tensorOffset, rewriter), rewriter,
+          op->getLoc(), op);
 
       auto bufferLoadOp = [&]() {
         if constexpr (std::is_same_v<SourceOp, triton::LoadOp>) {
@@ -576,7 +604,9 @@ struct ConvertTritonStoreToBufferStore
         contig = std::min<unsigned>(
             contig, axisAnalysisPass.getMaskAlignment(maybeMask));
       }
-      Value blockStride = getBlockStride(op->getLoc(), tensorOffset, rewriter);
+      Value blockStride = maybeTruncateStrideToI32(
+          getBlockStride(op->getLoc(), tensorOffset, rewriter), rewriter,
+          op->getLoc(), op);
 
       rewriter.replaceOpWithNewOp<triton::amdgpu::BufferStoreOp>(
           op, op.getValue(), basePtr, tensorOffset, blockStride, op.getCache(),

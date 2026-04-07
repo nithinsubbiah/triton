@@ -145,3 +145,35 @@ module attributes {"ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx942", "ttg.th
     tt.return
   }
 }
+
+// -----
+
+// 2D offset = row * stride + col with i64 stride; extracted block stride is the
+// scalar splat source (i64) and must be truncated to i32 for amdg.buffer_load
+// operand #2 (regression: verifier expected i32, got i64).
+
+#blocked6 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [8, 8], warpsPerCTA = [8, 1], order = [1, 0]}>
+
+// CHECK-LABEL: @stride_i64_minimal
+module attributes {"ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @stride_i64_minimal(
+    %ptr: !tt.ptr<f16> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32},
+    %stride: i64,
+    %row: tensor<256x1xi64, #blocked6>,
+    %col: tensor<1x64xi64, #blocked6>
+  ) -> tensor<256x64xf16, #blocked6> {
+    %s = tt.splat %stride : i64 -> tensor<256x1xi64, #blocked6>
+    %mul = arith.muli %row, %s : tensor<256x1xi64, #blocked6>
+    %bc0 = tt.broadcast %mul : tensor<256x1xi64, #blocked6> -> tensor<256x64xi64, #blocked6>
+    %bc1 = tt.broadcast %col : tensor<1x64xi64, #blocked6> -> tensor<256x64xi64, #blocked6>
+    %off = arith.addi %bc1, %bc0 : tensor<256x64xi64, #blocked6>
+    %base = tt.splat %ptr : !tt.ptr<f16> -> tensor<256x64x!tt.ptr<f16>, #blocked6>
+    %p = tt.addptr %base, %off : tensor<256x64x!tt.ptr<f16>, #blocked6>, tensor<256x64xi64, #blocked6>
+    // CHECK: arith.trunci {{.*}} : tensor<256x64xi64, {{.*}}> to tensor<256x64xi32, {{.*}}>
+    // CHECK: arith.trunci {{.*}} : i64 to i32
+    // CHECK: amdg.buffer_load
+    // CHECK-NOT: tt.load
+    %v = tt.load %p : tensor<256x64x!tt.ptr<f16>, #blocked6>
+    tt.return %v : tensor<256x64xf16, #blocked6>
+  }
+}
