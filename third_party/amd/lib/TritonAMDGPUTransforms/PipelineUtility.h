@@ -84,8 +84,7 @@ namespace ChainedDotSchedule {
 // it has to be be assigned to the *_1 clusters to ensure a valid schedule.
 //
 // K (dot1 operand) is loaded and consumed in the same stage as dot1, so K
-// tiles are NOT loop-carried. This reduces VGPR pressure by ~64 registers
-// compared to having K's local_load one stage before dot1.
+// tiles are NOT loop-carried.
 enum Clusters {
   // K wait + load (consumed immediately by dot1)
   CLUSTER_ASYNC_WAIT_1,
